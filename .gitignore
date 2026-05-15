@@ -1,0 +1,5 @@
+receipts.db
+__pycache__/
+.streamlit/
+.venv/
+.DS_Store
