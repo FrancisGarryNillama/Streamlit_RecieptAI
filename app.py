@@ -815,11 +815,14 @@ def render_investment_overview(monthly_income: float, summary: Dict[str, Any]) -
 def render_finance_dashboard(receipts: List[ReceiptRow]) -> None:
     records = finance_records(receipts)
     summary = summarize_finances(records)
+    monthly_income = 50000.0
+    savings_goal = 10000.0
 
     with st.sidebar:
         st.subheader("Finance Controls")
-        monthly_income = st.number_input("Monthly income target", min_value=0.0, value=50000.0, step=1000.0)
-        savings_goal = st.number_input("Monthly savings goal", min_value=1.0, value=10000.0, step=500.0)
+        st.markdown(f"**Monthly income target:** {peso(monthly_income)}")
+        st.markdown(f"**Monthly savings goal:** {peso(savings_goal)}")
+        st.caption("These planning assumptions keep the deployed dashboard stable and can be wired to account data later.")
 
     cols = st.columns(4)
     with cols[0]:
