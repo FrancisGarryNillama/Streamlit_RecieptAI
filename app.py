@@ -1,4 +1,5 @@
 import base64
+from collections import Counter, defaultdict
 import datetime as dt
 import json
 import os
@@ -12,6 +13,11 @@ try:
     import pandas as pd  # type: ignore
 except Exception:  # pragma: no cover
     pd = None  # type: ignore
+
+try:
+    import plotly.express as px  # type: ignore
+except Exception:  # pragma: no cover
+    px = None  # type: ignore
 
 from openai import OpenAI
 
@@ -401,13 +407,465 @@ def render_uploader_sidebar(conn: sqlite3.Connection) -> None:
         st.rerun()
 
 
+def parse_raw_ocr(raw_json: str) -> Dict[str, Any]:
+    if not raw_json:
+        return {}
+    try:
+        obj = json.loads(raw_json)
+    except Exception:
+        return {}
+    return obj if isinstance(obj, dict) else {}
+
+
+def receipt_to_finance_record(receipt: ReceiptRow) -> Dict[str, Any]:
+    raw = parse_raw_ocr(receipt.raw_ocr_json)
+    category = str(raw.get("expense_category") or "uncategorized").strip() or "uncategorized"
+    if category not in EXPENSE_CATEGORIES:
+        category = "uncategorized"
+
+    date_value = None
+    if receipt.expense_date:
+        try:
+            date_value = dt.date.fromisoformat(receipt.expense_date)
+        except Exception:
+            date_value = None
+
+    merchant = receipt.business_name.strip() or "Unknown merchant"
+    return {
+        "id": receipt.id,
+        "date": date_value,
+        "date_label": receipt.expense_date or "Undated",
+        "month": date_value.strftime("%Y-%m") if date_value else "Undated",
+        "merchant": merchant,
+        "category": category,
+        "category_label": category.replace("_", " ").title(),
+        "amount": float(receipt.total or 0.0),
+        "tin": receipt.tin,
+        "receipt_number": receipt.receipt_number,
+        "document_type": receipt.document_type or "unknown",
+        "description": receipt.description,
+    }
+
+
+def finance_records(receipts: List[ReceiptRow]) -> List[Dict[str, Any]]:
+    return [receipt_to_finance_record(r) for r in receipts]
+
+
+def records_dataframe(records: List[Dict[str, Any]]):
+    if pd is None:
+        return None
+    df = pd.DataFrame(records)
+    if df.empty:
+        return df
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0.0)
+    return df
+
+
+def peso(value: float) -> str:
+    return f"PHP {value:,.2f}"
+
+
+def summarize_finances(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    total_spend = sum(float(r["amount"]) for r in records)
+    categorized = Counter()
+    merchant_counts = Counter()
+    monthly = defaultdict(float)
+
+    for record in records:
+        amount = float(record["amount"])
+        categorized[record["category_label"]] += amount
+        merchant_counts[record["merchant"]] += 1
+        if record["month"] != "Undated":
+            monthly[record["month"]] += amount
+
+    average_transaction = total_spend / len(records) if records else 0.0
+    largest_category = categorized.most_common(1)[0] if categorized else ("No data", 0.0)
+    recurring_merchants = [name for name, count in merchant_counts.items() if count >= 2]
+
+    return {
+        "total_spend": total_spend,
+        "average_transaction": average_transaction,
+        "largest_category": largest_category,
+        "recurring_merchants": recurring_merchants[:5],
+        "monthly": dict(sorted(monthly.items())),
+        "category_totals": dict(categorized),
+        "transaction_count": len(records),
+    }
+
+
+def detect_finance_alerts(records: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    alerts: List[Dict[str, str]] = []
+    amounts = [float(r["amount"]) for r in records if float(r["amount"]) > 0]
+    average = sum(amounts) / len(amounts) if amounts else 0.0
+
+    for record in records:
+        amount = float(record["amount"])
+        if average and amount >= average * 2.5 and amount >= 1000:
+            alerts.append(
+                {
+                    "level": "High",
+                    "title": "Large transaction detected",
+                    "body": f"{record['merchant']} posted {peso(amount)}, well above your average transaction.",
+                }
+            )
+        if not record["tin"] or not record["receipt_number"]:
+            alerts.append(
+                {
+                    "level": "Review",
+                    "title": "Missing receipt compliance field",
+                    "body": f"{record['merchant']} is missing a TIN or receipt number.",
+                }
+            )
+
+    summary = summarize_finances(records)
+    if summary["recurring_merchants"]:
+        alerts.append(
+            {
+                "level": "Info",
+                "title": "Recurring merchants found",
+                "body": "Possible subscriptions or repeat bills: "
+                + ", ".join(summary["recurring_merchants"]),
+            }
+        )
+
+    return alerts[:6]
+
+
+def forecast_cash_flow(records: List[Dict[str, Any]], monthly_income: float) -> List[Dict[str, Any]]:
+    summary = summarize_finances(records)
+    monthly_values = list(summary["monthly"].values())
+    avg_spend = sum(monthly_values) / len(monthly_values) if monthly_values else summary["total_spend"]
+    avg_spend = avg_spend or 0.0
+
+    today = dt.date.today()
+    start_month = dt.date(today.year, today.month, 1)
+    forecast = []
+    balance = monthly_income - avg_spend
+    for i in range(1, 7):
+        month = start_month + dt.timedelta(days=32 * i)
+        month = dt.date(month.year, month.month, 1)
+        balance += monthly_income - avg_spend
+        forecast.append(
+            {
+                "month": month.strftime("%Y-%m"),
+                "projected_spend": round(avg_spend, 2),
+                "projected_net_cash": round(balance, 2),
+            }
+        )
+    return forecast
+
+
+def render_metric_card(label: str, value: str, caption: str = "") -> None:
+    st.markdown(
+        f"""
+        <div class="metric-card">
+            <div class="metric-label">{label}</div>
+            <div class="metric-value">{value}</div>
+            <div class="metric-caption">{caption}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_brand_styles() -> None:
+    st.markdown(
+        """
+        <style>
+        :root {
+            --finance-green: #006400;
+            --finance-gold: #FFD700;
+            --finance-ink: #10251a;
+            --finance-soft: #f7f9f4;
+        }
+        .stApp {
+            background: linear-gradient(180deg, #fbfcf7 0%, #f2f7ed 100%);
+            color: var(--finance-ink);
+        }
+        [data-testid="stSidebar"] {
+            background: #eef5ea;
+            border-right: 1px solid rgba(0, 100, 0, 0.16);
+        }
+        .finance-hero {
+            padding: 1.25rem 1.35rem;
+            border: 1px solid rgba(0, 100, 0, 0.18);
+            border-radius: 8px;
+            background: linear-gradient(135deg, #006400 0%, #0b7a2b 62%, #c5a900 100%);
+            color: #ffffff;
+            margin-bottom: 1rem;
+        }
+        .finance-hero h1 {
+            margin: 0;
+            font-size: clamp(2rem, 4vw, 3.2rem);
+            letter-spacing: 0;
+        }
+        .finance-hero p {
+            max-width: 760px;
+            margin: 0.45rem 0 0;
+            color: rgba(255, 255, 255, 0.86);
+        }
+        .metric-card, .alert-card, .module-panel {
+            border: 1px solid rgba(0, 100, 0, 0.16);
+            border-radius: 8px;
+            background: rgba(255, 255, 255, 0.92);
+            box-shadow: 0 8px 26px rgba(0, 64, 0, 0.06);
+        }
+        .metric-card {
+            min-height: 126px;
+            padding: 1rem;
+            border-top: 4px solid var(--finance-gold);
+        }
+        .metric-label {
+            color: #48624f;
+            font-size: 0.82rem;
+            text-transform: uppercase;
+            font-weight: 700;
+        }
+        .metric-value {
+            color: var(--finance-green);
+            font-size: 1.65rem;
+            font-weight: 800;
+            line-height: 1.2;
+            margin-top: 0.45rem;
+            overflow-wrap: anywhere;
+        }
+        .metric-caption {
+            color: #6d7c70;
+            font-size: 0.88rem;
+            margin-top: 0.35rem;
+        }
+        .alert-card {
+            padding: 0.9rem 1rem;
+            margin-bottom: 0.7rem;
+            border-left: 5px solid var(--finance-gold);
+        }
+        .alert-level {
+            color: var(--finance-green);
+            font-size: 0.74rem;
+            font-weight: 800;
+            text-transform: uppercase;
+        }
+        .alert-title {
+            font-weight: 800;
+            margin-top: 0.1rem;
+        }
+        .alert-body {
+            color: #536358;
+            font-size: 0.9rem;
+            margin-top: 0.2rem;
+        }
+        .stButton button {
+            border-radius: 8px;
+            border-color: #006400;
+        }
+        .stProgress > div > div > div > div {
+            background-color: var(--finance-gold);
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_spending_breakdown(records: List[Dict[str, Any]]) -> None:
+    st.subheader("Spending Breakdown")
+    df = records_dataframe(records)
+    if df is None or df.empty:
+        st.info("Upload receipts to generate category and merchant analytics.")
+        return
+
+    category_df = (
+        df.groupby("category_label", as_index=False)["amount"]
+        .sum()
+        .sort_values("amount", ascending=False)
+    )
+    merchant_df = (
+        df.groupby("merchant", as_index=False)["amount"]
+        .sum()
+        .sort_values("amount", ascending=False)
+        .head(8)
+    )
+
+    left, right = st.columns(2)
+    with left:
+        if px is not None:
+            fig = px.pie(
+                category_df,
+                names="category_label",
+                values="amount",
+                hole=0.42,
+                color_discrete_sequence=["#006400", "#FFD700", "#2e8b57", "#b59b00", "#77a86b"],
+            )
+            fig.update_layout(margin=dict(l=10, r=10, t=20, b=10), height=360)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.dataframe(category_df, use_container_width=True, hide_index=True)
+
+    with right:
+        if px is not None:
+            fig = px.bar(
+                merchant_df,
+                x="amount",
+                y="merchant",
+                orientation="h",
+                color_discrete_sequence=["#006400"],
+            )
+            fig.update_layout(
+                margin=dict(l=10, r=10, t=20, b=10),
+                height=360,
+                xaxis_title="Spend",
+                yaxis_title="Merchant",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.bar_chart(merchant_df.set_index("merchant"))
+
+
+def render_savings_tracker(summary: Dict[str, Any], monthly_income: float, savings_goal: float) -> None:
+    st.subheader("Savings Progress Tracker")
+    estimated_savings = max(monthly_income - summary["total_spend"], 0.0)
+    progress = min(estimated_savings / savings_goal, 1.0) if savings_goal else 0.0
+    st.progress(progress, text=f"{peso(estimated_savings)} saved toward {peso(savings_goal)}")
+
+    if estimated_savings <= 0 and monthly_income > 0:
+        st.warning("Current receipt spend is above the monthly income target. Tighten discretionary categories first.")
+    elif progress >= 1:
+        st.success("Savings goal is on track based on current recorded spending.")
+    else:
+        gap = max(savings_goal - estimated_savings, 0.0)
+        st.info(f"You need {peso(gap)} more to hit this savings goal.")
+
+
+def render_cash_flow_forecast(records: List[Dict[str, Any]], monthly_income: float) -> None:
+    st.subheader("Cash Flow Forecast")
+    forecast = forecast_cash_flow(records, monthly_income)
+    if pd is None:
+        st.dataframe(forecast, use_container_width=True)
+        return
+    df = pd.DataFrame(forecast)
+    if px is not None:
+        fig = px.line(
+            df,
+            x="month",
+            y=["projected_spend", "projected_net_cash"],
+            markers=True,
+            color_discrete_sequence=["#b59b00", "#006400"],
+        )
+        fig.update_layout(
+            margin=dict(l=10, r=10, t=20, b=10),
+            height=360,
+            xaxis_title="Month",
+            yaxis_title="PHP",
+            legend_title_text="Forecast",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.line_chart(df.set_index("month"))
+
+
+def render_alerts_panel(records: List[Dict[str, Any]]) -> None:
+    st.subheader("Alerts & Notifications")
+    alerts = detect_finance_alerts(records)
+    if not alerts:
+        st.success("No suspicious activity or compliance gaps detected yet.")
+        return
+    for alert in alerts:
+        st.markdown(
+            f"""
+            <div class="alert-card">
+                <div class="alert-level">{alert['level']}</div>
+                <div class="alert-title">{alert['title']}</div>
+                <div class="alert-body">{alert['body']}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+def render_investment_overview(monthly_income: float, summary: Dict[str, Any]) -> None:
+    st.subheader("Investment Overview")
+    investable = max(monthly_income - summary["total_spend"], 0.0)
+    conservative = investable * 0.5
+    balanced = investable * 0.3
+    flexible = investable * 0.2
+
+    data = [
+        {"Allocation": "Emergency / Cash Buffer", "Amount": conservative},
+        {"Allocation": "Index Funds / ETFs", "Amount": balanced},
+        {"Allocation": "Flexible Goals", "Amount": flexible},
+    ]
+    if pd is not None:
+        df = pd.DataFrame(data)
+        if px is not None:
+            fig = px.bar(
+                df,
+                x="Allocation",
+                y="Amount",
+                color="Allocation",
+                color_discrete_sequence=["#006400", "#FFD700", "#2e8b57"],
+            )
+            fig.update_layout(showlegend=False, margin=dict(l=10, r=10, t=20, b=10), height=320)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.bar_chart(df.set_index("Allocation"))
+    st.caption("Educational allocation model only. It is not personalized investment, legal, or tax advice.")
+
+
+def render_finance_dashboard(receipts: List[ReceiptRow]) -> None:
+    records = finance_records(receipts)
+    summary = summarize_finances(records)
+
+    with st.sidebar:
+        st.subheader("Finance Controls")
+        monthly_income = st.number_input("Monthly income target", min_value=0.0, value=50000.0, step=1000.0)
+        savings_goal = st.number_input("Monthly savings goal", min_value=1.0, value=10000.0, step=500.0)
+
+    cols = st.columns(4)
+    with cols[0]:
+        render_metric_card("Total Spend", peso(summary["total_spend"]), f"{summary['transaction_count']} transactions")
+    with cols[1]:
+        render_metric_card("Avg Transaction", peso(summary["average_transaction"]), "Receipt-level average")
+    with cols[2]:
+        category, amount = summary["largest_category"]
+        render_metric_card("Top Category", str(category), peso(float(amount)))
+    with cols[3]:
+        projected_save = max(monthly_income - summary["total_spend"], 0.0)
+        render_metric_card("Projected Savings", peso(projected_save), "Income less recorded spend")
+
+    st.divider()
+    render_spending_breakdown(records)
+
+    left, right = st.columns([1, 1])
+    with left:
+        render_savings_tracker(summary, monthly_income, savings_goal)
+        render_alerts_panel(records)
+    with right:
+        render_cash_flow_forecast(records, monthly_income)
+        render_investment_overview(monthly_income, summary)
+
+
 def finance_assistant_system_prompt(receipts: List[ReceiptRow]) -> str:
     table = receipts_to_markdown_table(receipts)
+    records = finance_records(receipts)
+    summary = summarize_finances(records)
+    alerts = detect_finance_alerts(records)
     return (
-        "You are a Finance Assistant. You answer questions based on the provided receipt data.\n"
-        "Reference specific business names and dates.\n"
+        "You are a Personal Finance Intelligence AI Assistant.\n"
+        "Use the saved receipt and transaction data to provide budgeting, spending, fraud, cash-flow, savings, "
+        "credit, lending, and investment education insights.\n"
+        "Be practical, transparent, and proactive. Mention uncertainty when the data is incomplete.\n"
+        "For lending and investment topics, explain tradeoffs clearly and avoid guaranteeing returns or approvals.\n"
+        "Reference specific merchants and dates when useful.\n"
         "Format currency as PHP X,XXX.XX.\n"
-        "If asked about BIR compliance, highlight if TIN or receipt numbers are missing.\n\n"
+        "If asked about automation, describe a recommended workflow rather than claiming you moved money.\n"
+        "If asked about fraud, flag anomalies based on unusually large transactions, missing fields, or repeat merchants.\n\n"
+        "Current analytics summary:\n"
+        f"- Total spend: {peso(summary['total_spend'])}\n"
+        f"- Average transaction: {peso(summary['average_transaction'])}\n"
+        f"- Largest category: {summary['largest_category'][0]} ({peso(float(summary['largest_category'][1]))})\n"
+        f"- Recurring merchants: {', '.join(summary['recurring_merchants']) or 'None detected'}\n"
+        f"- Active alerts: {len(alerts)}\n\n"
         "Receipt data (most recent first):\n"
         f"{table}\n"
     )
@@ -429,10 +887,20 @@ def chat_reply(client: OpenAI, *, system_prompt: str, messages: List[Dict[str, s
 
 
 def main() -> None:
-    st.set_page_config(page_title="Receipt AI Lite", layout="wide")
-    st.title("Receipt AI Lite")
-    st.caption("Upload receipts → extract fields → chat over your saved receipt database.")
-
+    st.set_page_config(page_title="Personal Finance Intelligence AI", layout="wide")
+    render_brand_styles()
+    st.markdown(
+        """
+        <section class="finance-hero">
+            <h1>Personal Finance Intelligence AI</h1>
+            <p>
+                Upload receipts, monitor spending, detect anomalies, forecast cash flow,
+                and chat with an AI assistant about your financial decisions.
+            </p>
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
     conn = get_conn()
     init_db(conn)
 
@@ -444,26 +912,73 @@ def main() -> None:
     receipts = fetch_receipts(conn)
     system_prompt = finance_assistant_system_prompt(receipts)
 
-    for m in st.session_state.messages:
-        with st.chat_message(m["role"]):
-            st.markdown(m["content"])
+    dashboard_tab, assistant_tab, transactions_tab = st.tabs(
+        ["Finance Dashboard", "AI Assistant", "Transactions"]
+    )
 
-    user_text = st.chat_input("Ask about totals, categories, missing TIN/receipt #, etc.")
-    if user_text:
-        st.session_state.messages.append({"role": "user", "content": user_text})
-        with st.chat_message("user"):
-            st.markdown(user_text)
+    with dashboard_tab:
+        render_finance_dashboard(receipts)
 
-        with st.chat_message("assistant"):
-            try:
-                client = get_client()
-                answer = chat_reply(client, system_prompt=system_prompt, messages=st.session_state.messages)
-                if not answer:
-                    answer = "I couldn't generate a response. Please try again."
-                st.markdown(answer)
-                st.session_state.messages.append({"role": "assistant", "content": answer})
-            except Exception as e:
-                st.error(str(e))
+    with assistant_tab:
+        st.subheader("Conversational Finance Assistant")
+        st.caption("Ask things like: Why did I spend more this month? How much can I save? Any suspicious activity?")
+
+        starter_cols = st.columns(4)
+        starter_prompts = [
+            "Why did I spend more recently?",
+            "How much can I save this month?",
+            "Find suspicious transactions.",
+            "What subscriptions or recurring bills do I have?",
+        ]
+        for idx, prompt in enumerate(starter_prompts):
+            with starter_cols[idx]:
+                if st.button(prompt, use_container_width=True):
+                    st.session_state.pending_prompt = prompt
+
+        for m in st.session_state.messages:
+            with st.chat_message(m["role"]):
+                st.markdown(m["content"])
+
+        user_text = st.chat_input("Ask about spending, savings, fraud alerts, cash flow, credit, or investments.")
+        if not user_text and st.session_state.get("pending_prompt"):
+            user_text = st.session_state.pop("pending_prompt")
+
+        if user_text:
+            st.session_state.messages.append({"role": "user", "content": user_text})
+            with st.chat_message("user"):
+                st.markdown(user_text)
+
+            with st.chat_message("assistant"):
+                try:
+                    client = get_client()
+                    answer = chat_reply(client, system_prompt=system_prompt, messages=st.session_state.messages)
+                    if not answer:
+                        answer = "I couldn't generate a response. Please try again."
+                    st.markdown(answer)
+                    st.session_state.messages.append({"role": "assistant", "content": answer})
+                except Exception as e:
+                    st.error(str(e))
+
+    with transactions_tab:
+        st.subheader("Transaction Intelligence Table")
+        records = finance_records(receipts)
+        df = records_dataframe(records)
+        if df is not None and not df.empty:
+            visible_cols = [
+                "date_label",
+                "merchant",
+                "category_label",
+                "amount",
+                "document_type",
+                "receipt_number",
+                "tin",
+                "description",
+            ]
+            st.dataframe(df[visible_cols], use_container_width=True, hide_index=True)
+        elif records:
+            st.dataframe(records, use_container_width=True)
+        else:
+            st.info("No receipt transactions yet. Upload a JPG or PNG receipt from the sidebar.")
 
 
 if __name__ == "__main__":
